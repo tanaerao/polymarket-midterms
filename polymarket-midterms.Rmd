@@ -1,0 +1,326 @@
+---
+title: "Polymarket Midterms"
+output:
+  html_document:
+    df_print: paged
+---
+
+This notebook scrapes data from the Trades tables on [Polymarket Whales](https://polymarketwhales.info/markets) for markets pertaining to the 2022 United States midterm elections. The data is available for each prediction market, trade-by-trade. This is intended for my personal use (I'm interested in the factors affecting the accuracy of monetized prediction markets), but I'm releasing this notebook because I couldn't find any data of this kind easily available on the internet. Hopefully this saves others curious about Polymarket's track record some time. 
+
+The data can be downloaded directly from [the GitHub repository](https://github.com/tanaerao/polymarket-midterms) in csv format.
+
+First, we'll create a dataframe of markets for which we want data, and their URLs on the Polymarket Whales webpage (this can be edited for those interested in other markets).
+
+```{r}
+library(readxl)
+
+#import an excel file with the full and short names of all midterm markets, links to the polymarketwhales.info trades data, and the resolution of the market.
+midterm_markets <- readxl::read_excel('polymarket-search-book.xlsx',sheet = 1)
+
+```
+
+The trade-by-trade data for each market will be generated as a dataframe with the named as the market_short_name.
+
+```{r}
+
+#create an empty list, into which we'll save dataframes for each market
+all_market_dfs <- list()
+
+for (market in 1:nrow(midterm_markets)) {
+  
+  #Resetting the output df
+  output_df <- 0
+  
+  for (i in 1:10000) {
+  
+  #getting the URL where the html table is located. Data for most markets is spread across dozens of pages, so we need to check each consecutive page until there is no more data to be saved
+  page <- paste0(midterm_markets$link_to_table[market],'&page=',as.character(i))
+  
+  rows_to_add <- read_html(page)
+  rows_to_add <- html_nodes(rows_to_add, "table")[1]
+  rows_to_add <- html_table(rows_to_add, convert = FALSE)
+  rows_to_add <- data.frame(rows_to_add[1])
+  
+  #cleaning up timestamps. The website measures time in *milliseconds* from 1970, hence the division by 1000.
+  rows_to_add$Timestamp <- as.numeric(rows_to_add$Timestamp)
+  rows_to_add$Timestamp <- as.POSIXct(rows_to_add$Timestamp/1000, origin="1970-01-01")
+  
+  
+  #once we get to an empty page, stop looking for more pages
+  if (nrow(rows_to_add) == 0) {
+    
+    break
+    
+  }
+  
+  #if we are on the first page, make the rows to add the output_df 
+  if (i == 1) {
+    
+    output_df <- rows_to_add
+    
+  }
+  
+  
+  #on all further pages, append the rows_to_add to the existing output_df
+  if (i > 1) {
+    
+    output_df <- rbind(output_df, rows_to_add)
+  }
+  }
+  
+  #now, do more cleaning:
+  
+  #1. remove any rows with NA values (for whatever reason)
+  output_df <- output_df[complete.cases(output_df),]
+  
+  #2. remove commas from strings, then convert appropriate columns to numeric
+  
+  output_df$Price <- as.numeric(gsub(",","",output_df$Price))
+  output_df$Amount <- as.numeric(gsub(',','',sub('.', '', output_df$Amount)))
+  output_df$Shares <- as.numeric(gsub(",","",output_df$Shares))
+  
+  
+  #finally, assign a new dataframe with the market_short_name, and append to the all_market_dfs list.
+  assign(midterm_markets$market_short_name[market], output_df)
+  all_market_dfs <- append(all_market_dfs, list(output_df))
+  
+}
+  
+```
+
+Each dataframe in the all_market_dfs can now be saved as a csv in a new folder entitled polymarket_midterms_data.
+
+```{r}
+
+dir.create("polymarket_midterms_data")
+
+
+write.csv(texas_governor, paste('polymarket_midterms_data/texas_governor','.csv', sep = ''))
+
+for (df in 1:length(all_market_dfs)) {
+  
+  write.csv(data.frame(all_market_dfs[df]), paste ('polymarket_midterms_data/',
+                                                   midterm_markets$market_short_name[df],
+                                                   '.csv',sep = ''))
+  
+}
+
+
+```
+
+
+The data extraction, cleaning, and saving on the local machine is complete. The rest of this notebook 
+
+
+## Checking whether the markets express consistent views.
+
+I noticed that three of the prediction markets can be linked by an arbitrage equation. There is:
+
+1. A market for whether the House will be Democratic.
+2. A market for whether the House will be Democratic *and* the Senate will be Democratic.
+2. A market for whether the House will be Democratic *and* the Senate will be Republican.
+
+Assuming that it must either be the case that the Senate is Democratic, or the Senate is Republican, we should expect the implied probability from market (1) to be equal to the implied probabilities from (2) and (3).
+
+First, I create a get_prices function to pull market prices at every time a trade was executed in an inputted market. (The complication is that some of the options in each market's data pay \$1 if Democrats win, and others \$1 if Republicans win. get_prices fixes this.)
+
+```{r}
+
+get_prices <- function(market_df) {
+  
+  market_df <- market_df[complete.cases(market_df),]
+  
+  market_df$Price <- as.numeric(market_df$Price)
+  
+  prices <- 0
+  
+  if ('Democrat' %in% market_df$Outcome) {
+  
+  prices <- data.frame(market_df$Timestamp, 
+                       ifelse(market_df$Outcome == 'Democrat',
+                              market_df$Price, 1 - market_df$Price))
+  }
+  
+  if ('Democratic' %in% market_df$Outcome) {
+  
+  prices <- data.frame(market_df$Timestamp, 
+                       ifelse(market_df$Outcome == 'Democratic',
+                              market_df$Price, 1 - market_df$Price))
+  }
+  
+  
+  if ('Yes' %in% market_df$Outcome) {
+  
+  prices <- data.frame(market_df$Timestamp, 
+                       ifelse(market_df$Outcome == 'Yes',
+                              market_df$Price, 1 - market_df$Price))
+  }
+  
+  
+  return(prices)
+  
+}
+
+```
+
+Each of the three markets has first and last trades at slightly different times, so, after running get_prices on each of them, I also use approxfun to get a function that takes a time and outputs a price linearly-interpolated from the available trades data.
+
+```{r}
+
+implied_pr_of_democratic_house <- approxfun(get_prices(us_house_overall))
+
+implied_pr_of_democratic_house_and_republican_senate <- approxfun(get_prices(democratic_house_and_republican_senate))
+
+implied_pr_of_democratic_house_and_democratic_senate <- approxfun(get_prices(democratic_house_and_democratic_senate))
+
+#appropriate start and stop times (roughly when markets started and stopped trading)
+times <- seq(1660334326,1668705007, by = 60)
+
+arbitrage_error <- implied_pr_of_democratic_house(times) - implied_pr_of_democratic_house_and_republican_senate(times) - implied_pr_of_democratic_house_and_democratic_senate(times)
+
+
+data_to_plot <- data.frame(
+  time = (as.POSIXct(times, origin = '1970-1-1')),
+  arbitrage_error
+)
+
+library(ggplot2)
+library(scales)
+
+
+ggplot(data = data_to_plot, aes(x = time, y = arbitrage_error)) +
+  geom_line(col = 'red') +
+  theme_minimal() +
+  ylab('Pricing Error') + 
+  scale_y_continuous(labels = scales::dollar_format(),
+                     limits = c(-0.5,0.75)) +
+  xlab('Time (2022)') +
+  ggtitle('Pricing error in 3 midterms markets')
+
+     
+```
+
+The plot above shows that, as expected, market (1)'s implied probability is roughly equal to the sum of (2) and (3). The pricing error has mean ~0. Its variance appears to increase as more trades are placed, but adjusts quickly back to 0.
+
+## Calculating Brier scores for each market.
+
+The Brier score for a binary market is the average squared distance between the market estimate and the true outcome. To illustrate how Brier scores can be calculated with this data, I take the hourly prices of each market, and compare them to the market's ultimate resolution.
+
+For example, if, at hour t, the market for the overall House prices an option paying \$1.00 if the Democrats win at \$0.50, then the corresponding Brier score for that single period is (1-0.50)^2 = 0.25. The overall Brier score for the market is the unweighted average of its Brier scores across all 1-hour periods, from the time the first trade was executed, to the time the most recent trade was executed.
+
+hourly_unweighted_brier is a function that does just this.
+
+```{r}
+
+hourly_unweighted_brier <- function(market_df, resolution) {
+  
+  
+  price_function <- approxfun(get_prices(market_df))
+  
+  
+  hourly <- seq(as.numeric(min(market_df$Timestamp)),
+                as.numeric(max(market_df$Timestamp)),
+                by = 3600)
+  
+  
+  losses = (price_function(hourly) - resolution)^2
+  
+  return(mean(losses))
+  
+}
+
+```
+
+I use this function to produce a table with the Brier scores for each of the 39 midterms markets on Polymarket, along with each market's number of trades, trading volume, and the number of periods over which the Brier score can be calculated.
+
+```{r}
+
+brier_aggregate <- function(all_market_dfs) {
+  
+  output_of_this_function <- data.frame(0,0,0,0,0,0)
+  #short name, brier, number of trades, volume, number of hour periods
+  
+  for (market in 1:length(all_market_dfs)) {
+    
+    if (midterm_markets$resolution[market] != 'ongoing') {
+      
+      
+      if (get_prices(data.frame(all_market_dfs[market])) != 0) {
+        
+        price_function <- approxfun(get_prices(data.frame(all_market_dfs[market])))
+      
+      hourly <- seq(as.numeric(min(data.frame(all_market_dfs[market])$Timestamp)),
+                as.numeric(max(data.frame(all_market_dfs[market])$Timestamp)),
+                by = 3600)
+      
+      brier <- mean((price_function(hourly) - as.numeric(midterm_markets$resolution[market]))^2)
+      
+      number_of_trades <- nrow(data.frame(all_market_dfs[market]))
+      
+      volume <- sum(data.frame(all_market_dfs[market])$Amount, na.rm = TRUE)
+      
+      number_of_hour_periods <- length(hourly)
+      
+      first_price <- (tail(data.frame(all_market_dfs[market])$Price, n=1) - as.numeric(midterm_markets$resolution[market]))^2
+      
+      
+      output_of_this_function <- rbind(output_of_this_function, c(
+        midterm_markets$market_short_name[market],
+        brier,
+        number_of_trades,
+        volume,
+        number_of_hour_periods, 
+        first_price))
+        
+      }
+      
+    }
+    
+  }
+  
+  
+  return(output_of_this_function)
+  
+  
+  
+  
+}
+
+all_markets_brier <- brier_aggregate(all_market_dfs)
+
+look <- look[complete.cases(all_markets_brier),]
+
+all_markets_brier <- all_markets_brier[-1,]
+
+names(all_markets_brier) <- c('short_name', 'brier', 'number_of_trades','volume', 'number_of_hour_periods', 'first_price_brier')
+
+all_markets_brier$brier <- as.numeric(all_markets_brier$brier)
+all_markets_brier$number_of_trades <- as.numeric(all_markets_brier$number_of_trades)
+all_markets_brier$number_of_hour_periods <- as.numeric(all_markets_brier$number_of_hour_periods)
+all_markets_brier$volume <- as.numeric(all_markets_brier$volume)
+all_markets_brier$first_price_brier <- as.numeric(all_markets_brier$first_price_brier)
+
+library(stargazer)
+
+stargazer(all_markets_brier)
+
+
+```
+
+In the table above, 'First Price Brier' is the Brier score of a hypothetical market where the first ever traded price was 'locked in' as an unchanging prediction across all periods. For markets with high liquidity, comparing the actual Brier score to the First Price Brier is roughly asking whether the market maker, who set the initial price, was more accurate than the market itself.
+
+## Future research
+
+This dataset is insufficient for making inferences about the effects of volume, trading activity, etc. on prediction accuracy. Besides two markets with >$500K USD in volume, most markets were small, with few participating traders. Moreover, the markets were not opened at the same time, nor did they close at the same time, skewing my naively-estimated Brier scores.
+
+Using similar methods, more data from different markets on Polymarket, as well as other monetized prediction platforms, could help rectify the issue. However, this would likely mean sacrificing the thematic focus of this dataset on a particular set of elections (although scraping price data from *all* politics-themed prediction markets could yield fertile grounds for research).
+
+More broadly, some questions in this area include:
+
+1. Are prediction markets more accurate, the more money is involved? 
+
+2. Do very large trades (on the order of $100K+ USD) distort prediction markets in a way for which we can adjust to get more accurate probabilities?
+
+3. How does market performance differ depending on the topic of question asked? For example, are prediction markets better at predicting inflation than election results?
+
+4. How do market predictions compare to those of experts, such as [FiveThirtyEight](https://fivethirtyeight.com/)? How does this differ depending on the time scale over which prediction accuracy is measured (e.g., perhaps markets are worse at long-term predictions, but are better at quickly incorporating breaking news into prices)?
